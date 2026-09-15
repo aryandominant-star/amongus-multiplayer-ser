@@ -1,1339 +1,516 @@
+/* ============================================================================
+   SPACE PARTY — server.js
+   Authoritative multiplayer server (Node + Socket.IO). Implements exactly the
+   event protocol the browser client uses, and adds map selection:
+     createRoom { name, playerNumber, impostorCount, mapId? }
+     setMap     { mapId }              (host only, in the lobby)   -> roomUpdated
+   Everything else is unchanged from the original protocol.
+   ============================================================================ */
 'use strict';
 
-const path = require('path');
 const http = require('http');
-const crypto = require('crypto');
-const express = require('express');
 const { Server } = require('socket.io');
+const Maps = require('./maps');
 
-const PORT = Number(process.env.PORT || 3000);
-const TICK_RATE = Number(process.env.TICK_RATE || 30);
+const PORT = process.env.PORT || 3000;
+const TICK_HZ = 30;
+const SPEED = 230;                 // px / s
+const KILL_RANGE = 90;
+const KILL_COOLDOWN_MS = 24000;
+const DISCUSSION_MS = 15000;
+const VOTING_MS = 30000;
+const EJECT_MS = 5200;
+const TASKS_PER_PLAYER = 6;
 const MAX_PLAYERS = 10;
-const MIN_PLAYERS_TO_START = Number(process.env.MIN_PLAYERS_TO_START || 4);
-const PLAYER_SPEED = Number(process.env.PLAYER_SPEED || 220); // pixels / second
-const PLAYER_RADIUS = 18;
-const KILL_RADIUS = 85;
-const REPORT_RADIUS = 110;
-const VENT_RADIUS = 90;
-const TASK_RADIUS = 120;
-const EMERGENCY_RADIUS = 100;
-const KILL_COOLDOWN_MS = Number(process.env.KILL_COOLDOWN_MS || 25_000);
-const INITIAL_KILL_COOLDOWN_MS = Number(process.env.INITIAL_KILL_COOLDOWN_MS || 10_000);
-const DISCUSSION_MS = Number(process.env.DISCUSSION_MS || 10_000);
-const VOTING_MS = Number(process.env.VOTING_MS || 45_000);
-const EMERGENCY_MEETINGS_PER_PLAYER = Number(process.env.EMERGENCY_MEETINGS_PER_PLAYER || 1);
+const MIN_PLAYERS = 4;
+const VIEW_RANGE = 700;            // how far a kill effect is broadcast
 
-const GameState = Object.freeze({
-  LOBBY: 'Lobby',
-  PLAYING: 'Playing',
-  MEETING: 'Meeting',
-  GAME_OVER: 'GameOver',
+const COLORS = [
+  { number: 1, color: 'red', hex: '#d93b3b' }, { number: 2, color: 'blue', hex: '#3b66d9' },
+  { number: 3, color: 'green', hex: '#39a85a' }, { number: 4, color: 'pink', hex: '#ef72b7' },
+  { number: 5, color: 'orange', hex: '#f59b42' }, { number: 6, color: 'yellow', hex: '#f3d84a' },
+  { number: 7, color: 'black', hex: '#2c2c35' }, { number: 8, color: 'white', hex: '#e8edf2' },
+  { number: 9, color: 'purple', hex: '#7952b3' }, { number: 10, color: 'cyan', hex: '#46c7c7' },
+];
+
+const rooms = new Map();           // roomCode -> room
+const socketRoom = new Map();      // socket.id -> roomCode
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const shuffle = arr => { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const ok = (cb, extra = {}) => typeof cb === 'function' && cb({ ok: true, ...extra });
+const fail = (cb, error) => typeof cb === 'function' && cb({ ok: false, error });
+
+/* ---------------------------------------------------------------------------
+   HTTP + Socket.IO
+   --------------------------------------------------------------------------- */
+const httpServer = http.createServer((req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ ok: true, name: 'space-party-server', rooms: rooms.size, maps: Maps.MAP_LIST.map(m => m.id), time: Date.now() }));
 });
+const io = new Server(httpServer, { cors: { origin: '*', methods: ['GET', 'POST'] }, pingInterval: 10000, pingTimeout: 20000 });
 
-const PLAYER_SLOTS = Object.freeze([
-  { number: 1, color: 'red', hex: '#d93b3b' },
-  { number: 2, color: 'blue', hex: '#3b66d9' },
-  { number: 3, color: 'green', hex: '#39a85a' },
-  { number: 4, color: 'pink', hex: '#ef72b7' },
-  { number: 5, color: 'orange', hex: '#f59b42' },
-  { number: 6, color: 'yellow', hex: '#f3d84a' },
-  { number: 7, color: 'black', hex: '#2c2c35' },
-  { number: 8, color: 'white', hex: '#e8edf2' },
-  { number: 9, color: 'purple', hex: '#7952b3' },
-  { number: 10, color: 'cyan', hex: '#46c7c7' },
-]);
-
-// This same geometry can be copied/shared with the browser in Step 3.
-const MAP = Object.freeze({
-  id: 'station-alpha',
-  width: 1600,
-  height: 900,
-  spawn: { x: 800, y: 450 },
-  emergencyButton: { x: 800, y: 450 },
-  rooms: [
-    { id: 'reactor', name: 'Reactor', x: 20, y: 20, w: 470, h: 410 },
-    { id: 'electrical', name: 'Electrical', x: 20, y: 470, w: 470, h: 410 },
-    { id: 'cafeteria', name: 'Cafeteria', x: 510, y: 20, w: 580, h: 860 },
-    { id: 'o2', name: 'O2', x: 1110, y: 20, w: 470, h: 410 },
-    { id: 'shields', name: 'Shields', x: 1110, y: 470, w: 470, h: 410 },
-  ],
-  // Interior walls. Gaps act as doorways/corridors.
-  collisionRects: [
-    { x: 490, y: 0, w: 20, h: 300 },
-    { x: 490, y: 600, w: 20, h: 300 },
-    { x: 1090, y: 0, w: 20, h: 300 },
-    { x: 1090, y: 600, w: 20, h: 300 },
-    { x: 0, y: 430, w: 180, h: 20 },
-    { x: 320, y: 430, w: 170, h: 20 },
-    { x: 1110, y: 430, w: 170, h: 20 },
-    { x: 1420, y: 430, w: 180, h: 20 },
-  ],
-  vents: [
-    { id: 'vent-reactor', room: 'reactor', x: 190, y: 170, connections: ['vent-electrical', 'vent-o2'] },
-    { id: 'vent-electrical', room: 'electrical', x: 240, y: 700, connections: ['vent-reactor', 'vent-shields'] },
-    { id: 'vent-o2', room: 'o2', x: 1360, y: 175, connections: ['vent-reactor', 'vent-shields'] },
-    { id: 'vent-shields', room: 'shields', x: 1360, y: 700, connections: ['vent-electrical', 'vent-o2'] },
-  ],
-});
-
-const TASK_LIBRARY = Object.freeze([
-  { templateId: 'reactor-sequence', type: 'sequence', name: 'Start Reactor', room: 'reactor', x: 170, y: 260 },
-  { templateId: 'electrical-wires', type: 'wires', name: 'Fix Wiring', room: 'electrical', x: 280, y: 650 },
-  { templateId: 'o2-filter', type: 'button_hold', name: 'Clean O2 Filter', room: 'o2', x: 1350, y: 255 },
-  { templateId: 'shields-charge', type: 'button_hold', name: 'Prime Shields', room: 'shields', x: 1340, y: 650 },
-  { templateId: 'cafeteria-card', type: 'card_swipe', name: 'Swipe ID Card', room: 'cafeteria', x: 690, y: 520 },
-  { templateId: 'cafeteria-align', type: 'sequence', name: 'Align Navigation', room: 'cafeteria', x: 930, y: 340 },
-]);
-
-const SPAWN_POINTS = Object.freeze([
-  { x: 730, y: 390 }, { x: 800, y: 390 }, { x: 870, y: 390 },
-  { x: 700, y: 450 }, { x: 900, y: 450 },
-  { x: 700, y: 520 }, { x: 900, y: 520 },
-  { x: 750, y: 570 }, { x: 820, y: 570 }, { x: 870, y: 570 },
-]);
-
-const app = express();
-const httpServer = http.createServer(app);
-
-const allowedOrigins = (process.env.CORS_ORIGIN || '')
-  .split(',')
-  .map((v) => v.trim())
-  .filter(Boolean);
-
-const io = new Server(httpServer, {
-  cors: allowedOrigins.length
-    ? { origin: allowedOrigins, methods: ['GET', 'POST'] }
-    : undefined,
-  transports: ['websocket', 'polling'],
-  pingInterval: 25_000,
-  pingTimeout: 20_000,
-});
-
-app.use(express.json({ limit: '32kb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-
-/** @type {Map<string, any>} */
-const rooms = new Map();
-
-class GameError extends Error {
-  constructor(message, code = 'BAD_REQUEST') {
-    super(message);
-    this.name = 'GameError';
-    this.code = code;
-  }
+/* ---------------------------------------------------------------------------
+   Room helpers
+   --------------------------------------------------------------------------- */
+function makeCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  do { code = ''; for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)]; } while (rooms.has(code));
+  return code;
 }
 
-function now() {
-  return Date.now();
+function publicPlayer(p) {
+  return { socketId: p.socketId, name: p.name, number: p.number, color: p.color, colorHex: p.colorHex, isAlive: p.isAlive };
 }
 
-function touchRoom(room) {
-  room.updatedAt = now();
-}
-
-function safeDisplayName(value) {
-  if (typeof value !== 'string') {
-    throw new GameError('Name is required.', 'INVALID_NAME');
-  }
-
-  const cleaned = value
-    .trim()
-    .replace(/[\u0000-\u001F\u007F]/g, '')
-    .slice(0, 16);
-
-  if (!cleaned) {
-    throw new GameError('Name is required.', 'INVALID_NAME');
-  }
-
-  return cleaned;
-}
-
-function normalizeRoomCode(value) {
-  if (typeof value !== 'string') return '';
-  return value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
-}
-
-function normalizePlayerNumber(value) {
-  const number = Number(value);
-  if (!Number.isInteger(number) || number < 1 || number > MAX_PLAYERS) {
-    throw new GameError('Player number must be between 1 and 10.', 'INVALID_PLAYER_NUMBER');
-  }
-  return number;
-}
-
-function getSlot(number) {
-  const slot = PLAYER_SLOTS.find((s) => s.number === number);
-  if (!slot) {
-    throw new GameError('Invalid player slot.', 'INVALID_PLAYER_NUMBER');
-  }
-  return slot;
-}
-
-function randomRoomCode() {
-  const mode = (process.env.ROOM_CODE_MODE || 'letters').toLowerCase();
-
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    let code = '';
-
-    if (mode === 'digits') {
-      code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
-    } else {
-      // Avoid I/O to reduce visual confusion with 1/0.
-      const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-      for (let i = 0; i < 4; i += 1) {
-        code += alphabet[crypto.randomInt(0, alphabet.length)];
-      }
-    }
-
-    if (!rooms.has(code)) return code;
-  }
-
-  throw new GameError('Could not allocate a room code. Please try again.', 'ROOM_CODE_EXHAUSTED');
-}
-
-function cryptoShuffle(items) {
-  const result = [...items];
-  for (let i = result.length - 1; i > 0; i -= 1) {
-    const j = crypto.randomInt(0, i + 1);
-    [result[i], result[j]] = [result[j], result[i]];
-  }
-  return result;
-}
-
-function makePlayer(socketId, name, playerNumber, spawnIndex = 0) {
-  const slot = getSlot(playerNumber);
-  const spawn = SPAWN_POINTS[spawnIndex % SPAWN_POINTS.length] || MAP.spawn;
-
+function roomPayload(room) {
   return {
-    socketId,
-    name,
-    number: slot.number,
-    color: slot.color,
-    colorHex: slot.hex,
-    isImpostor: false,
-    isAlive: true,
-    currentX: spawn.x,
-    currentY: spawn.y,
-    input: { up: false, down: false, left: false, right: false },
-    tasks: [],
-    inVent: false,
-    currentVentId: null,
-    killCooldownUntil: 0,
-    emergencyMeetingsRemaining: EMERGENCY_MEETINGS_PER_PLAYER,
-    joinedAt: now(),
-  };
-}
-
-function createRoom(socketId, payload = {}) {
-  const roomCode = randomRoomCode();
-  const name = safeDisplayName(payload.name);
-  const playerNumber = normalizePlayerNumber(payload.playerNumber);
-
-  const requestedImpostors = Number(payload.impostorCount || 1);
-  const impostorCount = Number.isInteger(requestedImpostors)
-    ? Math.max(1, Math.min(3, requestedImpostors))
-    : 1;
-
-  const player = makePlayer(socketId, name, playerNumber, 0);
-  const room = {
-    roomCode,
-    hostSocketId: socketId,
-    playerList: [player],
-    gameState: GameState.LOBBY,
-    impostorCount,
-    tasksCompleted: 0,
-    totalTasks: 0,
-    bodies: [],
-    meeting: null,
-    winner: null,
-    gameOverReason: null,
-    createdAt: now(),
-    updatedAt: now(),
-  };
-
-  rooms.set(roomCode, room);
-  return room;
-}
-
-function publicPlayer(player) {
-  return {
-    socketId: player.socketId,
-    name: player.name,
-    number: player.number,
-    color: player.color,
-    colorHex: player.colorHex,
-    isAlive: player.isAlive,
-  };
-}
-
-function publicRoomState(room) {
-  const takenPlayerNumbers = room.playerList.map((p) => p.number);
-
-  return {
-    roomCode: room.roomCode,
-    hostSocketId: room.hostSocketId,
-    gameState: room.gameState,
+    gameState: room.state,
+    roomCode: room.code,
+    hostSocketId: room.hostId,
     impostorCount: room.impostorCount,
-    tasksCompleted: room.tasksCompleted,
-    totalTasks: room.totalTasks,
-    taskProgress: getTaskProgress(room),
-    playerList: room.playerList.map(publicPlayer),
-    takenPlayerNumbers,
-    availablePlayerNumbers: PLAYER_SLOTS
-      .map((slot) => slot.number)
-      .filter((number) => !takenPlayerNumbers.includes(number)),
     maxPlayers: MAX_PLAYERS,
+    mapId: room.mapId,
+    mapName: (Maps.MAPS[room.mapId] || Maps.MAPS.skeld).name,
+    playerList: [...room.players.values()].map(publicPlayer),
   };
 }
 
-function getTaskProgress(room) {
-  if (room.totalTasks <= 0) return 0;
-  return Math.max(0, Math.min(1, room.tasksCompleted / room.totalTasks));
-}
+function broadcastRoom(room) { io.to(room.code).emit('roomUpdated', roomPayload(room)); }
+function alive(room) { return [...room.players.values()].filter(p => p.isAlive); }
+function roomOf(room, p) { return (room.map._namedRooms.find(r => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) || {}).name || 'the hallway'; }
+const publicBody = b => ({ id: b.id, x: b.x, y: b.y, victimSocketId: b.victimSocketId, victimName: b.victimName, victimColorHex: b.victimColorHex });
 
-function getRoomForSocket(socket) {
-  const roomCode = socket.data.roomCode;
-  if (!roomCode) {
-    throw new GameError('You are not in a room.', 'NOT_IN_ROOM');
-  }
-
-  const room = rooms.get(roomCode);
-  if (!room) {
-    socket.data.roomCode = null;
-    throw new GameError('Room no longer exists.', 'ROOM_NOT_FOUND');
-  }
-
-  return room;
-}
-
-function getPlayer(room, socketId) {
-  const player = room.playerList.find((p) => p.socketId === socketId);
-  if (!player) {
-    throw new GameError('Player not found in room.', 'PLAYER_NOT_FOUND');
-  }
-  return player;
-}
-
-function assertHost(room, socketId) {
-  if (room.hostSocketId !== socketId) {
-    throw new GameError('Only the host can do that.', 'HOST_ONLY');
-  }
-}
-
-function assertGameState(room, expected) {
-  if (room.gameState !== expected) {
-    throw new GameError(`Action is only valid while game state is ${expected}.`, 'INVALID_GAME_STATE');
-  }
-}
-
-function addPlayerToRoom(room, socketId, payload = {}) {
-  assertGameState(room, GameState.LOBBY);
-
-  if (room.playerList.length >= MAX_PLAYERS) {
-    throw new GameError('Room is full.', 'ROOM_FULL');
-  }
-
-  const name = safeDisplayName(payload.name);
-  const playerNumber = normalizePlayerNumber(payload.playerNumber);
-
-  if (room.playerList.some((p) => p.number === playerNumber)) {
-    throw new GameError('That player number/color is already taken.', 'PLAYER_NUMBER_TAKEN');
-  }
-
-  const player = makePlayer(socketId, name, playerNumber, room.playerList.length);
-  room.playerList.push(player);
-  touchRoom(room);
-  return player;
-}
-
-function sanitizeMapForClient() {
+function makePlayer(socket, name, number) {
+  const c = COLORS.find(x => x.number === number);
   return {
-    id: MAP.id,
-    width: MAP.width,
-    height: MAP.height,
-    spawn: MAP.spawn,
-    emergencyButton: MAP.emergencyButton,
-    rooms: MAP.rooms,
-    collisionRects: MAP.collisionRects,
-    vents: MAP.vents,
+    socketId: socket.id, name, number, color: c.color, colorHex: c.hex,
+    isAlive: true, isImpostor: false, x: 0, y: 0, inVent: null, killCooldownUntil: 0,
+    input: { up: false, down: false, left: false, right: false },
   };
 }
 
-function assignTasks(player, isFake = false) {
-  const chosen = cryptoShuffle(TASK_LIBRARY).slice(0, 3);
-  return chosen.map((task) => ({
-    id: crypto.randomUUID(),
-    templateId: task.templateId,
-    type: task.type,
-    name: task.name,
-    room: task.room,
-    x: task.x,
-    y: task.y,
-    completed: false,
-    isFake,
-  }));
-}
-
-function resetPlayerForGame(player, spawnIndex) {
-  const spawn = SPAWN_POINTS[spawnIndex % SPAWN_POINTS.length] || MAP.spawn;
-  player.isAlive = true;
-  player.currentX = spawn.x;
-  player.currentY = spawn.y;
-  player.input = { up: false, down: false, left: false, right: false };
-  player.inVent = false;
-  player.currentVentId = null;
-  player.killCooldownUntil = now() + INITIAL_KILL_COOLDOWN_MS;
-  player.emergencyMeetingsRemaining = EMERGENCY_MEETINGS_PER_PLAYER;
-}
-
-function startGame(room) {
-  if (room.playerList.length < MIN_PLAYERS_TO_START) {
-    throw new GameError(
-      `At least ${MIN_PLAYERS_TO_START} players are required to start.`,
-      'NOT_ENOUGH_PLAYERS'
-    );
-  }
-
-  const maxImpostors = Math.max(1, Math.floor((room.playerList.length - 1) / 2));
-  const impostorCount = Math.max(1, Math.min(room.impostorCount, maxImpostors));
-  room.impostorCount = impostorCount;
-
-  const shuffledPlayers = cryptoShuffle(room.playerList);
-  const impostorIds = new Set(shuffledPlayers.slice(0, impostorCount).map((p) => p.socketId));
-
-  room.tasksCompleted = 0;
-  room.totalTasks = 0;
-  room.bodies = [];
-  room.winner = null;
-  room.gameOverReason = null;
-  room.meeting = null;
-  room.gameState = GameState.PLAYING;
-
-  room.playerList.forEach((player, index) => {
-    resetPlayerForGame(player, index);
-    player.isImpostor = impostorIds.has(player.socketId);
-    player.tasks = assignTasks(player, player.isImpostor);
-
-    if (!player.isImpostor) {
-      room.totalTasks += player.tasks.length;
-    }
-  });
-
-  touchRoom(room);
-}
-
-function distance(aX, aY, bX, bY) {
-  return Math.hypot(aX - bX, aY - bY);
-}
-
-function circleIntersectsRect(cx, cy, radius, rect) {
-  const closestX = Math.max(rect.x, Math.min(cx, rect.x + rect.w));
-  const closestY = Math.max(rect.y, Math.min(cy, rect.y + rect.h));
-  const dx = cx - closestX;
-  const dy = cy - closestY;
-  return dx * dx + dy * dy < radius * radius;
-}
-
-function collidesWithMap(x, y) {
-  if (
-    x - PLAYER_RADIUS < 0 ||
-    y - PLAYER_RADIUS < 0 ||
-    x + PLAYER_RADIUS > MAP.width ||
-    y + PLAYER_RADIUS > MAP.height
-  ) {
-    return true;
-  }
-
-  return MAP.collisionRects.some((rect) => circleIntersectsRect(x, y, PLAYER_RADIUS, rect));
-}
-
-function movePlayer(player, deltaSeconds) {
-  if (!player.isAlive || player.inVent) return;
-
-  let dx = 0;
-  let dy = 0;
-  if (player.input.left) dx -= 1;
-  if (player.input.right) dx += 1;
-  if (player.input.up) dy -= 1;
-  if (player.input.down) dy += 1;
-
-  if (dx === 0 && dy === 0) return;
-
-  const length = Math.hypot(dx, dy);
-  dx /= length;
-  dy /= length;
-
-  const stepX = dx * PLAYER_SPEED * deltaSeconds;
-  const stepY = dy * PLAYER_SPEED * deltaSeconds;
-
-  const candidateX = player.currentX + stepX;
-  if (!collidesWithMap(candidateX, player.currentY)) {
-    player.currentX = candidateX;
-  }
-
-  const candidateY = player.currentY + stepY;
-  if (!collidesWithMap(player.currentX, candidateY)) {
-    player.currentY = candidateY;
-  }
-}
-
-function serializeBody(body) {
-  return {
-    id: body.id,
-    victimSocketId: body.victimSocketId,
-    victimName: body.victimName,
-    victimNumber: body.victimNumber,
-    victimColor: body.victimColor,
-    victimColorHex: body.victimColorHex,
-    x: body.x,
-    y: body.y,
-    reported: body.reported,
-    createdAt: body.createdAt,
+function createRoom(socket, payload, cb) {
+  const name = String(payload?.name || '').trim().slice(0, 16);
+  const number = Number(payload?.playerNumber);
+  if (!name) return fail(cb, 'Enter a display name.');
+  if (!COLORS.some(c => c.number === number)) return fail(cb, 'Choose a suit color.');
+  if (socketRoom.has(socket.id)) leaveRoom(socket);
+  const mapId = Maps.MAPS[payload?.mapId] ? payload.mapId : 'skeld';
+  const room = {
+    code: makeCode(), hostId: socket.id, impostorCount: Math.max(1, Math.min(3, Number(payload?.impostorCount) || 1)),
+    mapId, map: Maps.buildMap(mapId), nav: null, state: 'Lobby', players: new Map(),
+    bodies: [], tasks: new Map(), taskDone: 0, taskTotal: 0, meeting: null, tick: null, lastTick: 0, timers: new Set(),
   };
+  room.players.set(socket.id, makePlayer(socket, name, number));
+  rooms.set(room.code, room);
+  socketRoom.set(socket.id, room.code);
+  socket.join(room.code);
+  ok(cb, { room: roomPayload(room) });
+  broadcastRoom(room);
 }
 
-function removeOutstandingTasksForDeadCrew(room, player) {
-  if (player.isImpostor) return;
-
-  const incomplete = player.tasks.filter((task) => !task.completed).length;
-  if (incomplete > 0) {
-    room.totalTasks = Math.max(room.tasksCompleted, room.totalTasks - incomplete);
-  }
+function joinRoom(socket, payload, cb) {
+  const room = rooms.get(String(payload?.roomCode || '').toUpperCase());
+  const name = String(payload?.name || '').trim().slice(0, 16);
+  const number = Number(payload?.playerNumber);
+  if (!room) return fail(cb, 'Room not found.');
+  if (room.state !== 'Lobby') return fail(cb, 'That game is already in progress.');
+  if (room.players.size >= MAX_PLAYERS) return fail(cb, 'Room is full.');
+  if (!name) return fail(cb, 'Enter a display name.');
+  if (!COLORS.some(c => c.number === number)) return fail(cb, 'Choose a suit color.');
+  if ([...room.players.values()].some(p => p.number === number)) return fail(cb, 'That color is taken.');
+  if (socketRoom.has(socket.id)) leaveRoom(socket);
+  room.players.set(socket.id, makePlayer(socket, name, number));
+  socketRoom.set(socket.id, room.code);
+  socket.join(room.code);
+  ok(cb, { room: roomPayload(room) });
+  broadcastRoom(room);
 }
 
-function emitTaskProgress(room) {
-  io.to(room.roomCode).emit('taskProgress', {
-    completed: room.tasksCompleted,
-    total: room.totalTasks,
-    progress: getTaskProgress(room),
-  });
-}
-
-function checkWinConditions(room) {
-  if (![GameState.PLAYING, GameState.MEETING].includes(room.gameState)) {
-    return false;
-  }
-
-  const living = room.playerList.filter((p) => p.isAlive);
-  const livingImpostors = living.filter((p) => p.isImpostor).length;
-  const livingCrewmates = living.filter((p) => !p.isImpostor).length;
-
-  if (livingImpostors === 0) {
-    endGame(room, 'Crewmates', 'All impostors were eliminated.');
-    return true;
-  }
-
-  if (livingImpostors >= livingCrewmates) {
-    endGame(room, 'Impostors', 'Impostors reached parity with the crewmates.');
-    return true;
-  }
-
-  if (room.totalTasks > 0 && room.tasksCompleted >= room.totalTasks) {
-    endGame(room, 'Crewmates', 'All required tasks were completed.');
-    return true;
-  }
-
-  return false;
-}
-
-function clearMeetingTimer(room) {
-  if (room.meeting && room.meeting.timer) {
-    clearTimeout(room.meeting.timer);
-    room.meeting.timer = null;
-  }
-}
-
-function endGame(room, winner, reason) {
-  clearMeetingTimer(room);
-  room.gameState = GameState.GAME_OVER;
-  room.winner = winner;
-  room.gameOverReason = reason;
-
-  room.playerList.forEach((player) => {
-    player.input = { up: false, down: false, left: false, right: false };
-    player.inVent = false;
-    player.currentVentId = null;
-  });
-
-  touchRoom(room);
-
-  io.to(room.roomCode).emit('gameOver', {
-    winner,
-    reason,
-    players: room.playerList.map((player) => ({
-      ...publicPlayer(player),
-      isImpostor: player.isImpostor,
-    })),
-  });
-}
-
-function getVent(ventId) {
-  return MAP.vents.find((vent) => vent.id === ventId);
-}
-
-function beginMeeting(room, trigger) {
-  if (room.gameState !== GameState.PLAYING) {
-    throw new GameError('A meeting cannot start right now.', 'INVALID_GAME_STATE');
-  }
-
-  const startedAt = now();
-  const meeting = {
-    id: crypto.randomUUID(),
-    trigger,
-    startedAt,
-    votingStartsAt: startedAt + DISCUSSION_MS,
-    votingEndsAt: startedAt + DISCUSSION_MS + VOTING_MS,
-    votes: new Map(),
-    timer: null,
-  };
-
-  room.gameState = GameState.MEETING;
-  room.meeting = meeting;
-
-  room.playerList.forEach((player) => {
-    player.input = { up: false, down: false, left: false, right: false };
-    player.inVent = false;
-    player.currentVentId = null;
-  });
-
-  meeting.timer = setTimeout(() => {
-    const currentRoom = rooms.get(room.roomCode);
-    if (!currentRoom || currentRoom.gameState !== GameState.MEETING) return;
-    if (!currentRoom.meeting || currentRoom.meeting.id !== meeting.id) return;
-    resolveMeeting(currentRoom);
-  }, DISCUSSION_MS + VOTING_MS);
-
-  touchRoom(room);
-
-  io.to(room.roomCode).emit('meetingStarted', {
-    meetingId: meeting.id,
-    trigger,
-    startedAt: meeting.startedAt,
-    votingStartsAt: meeting.votingStartsAt,
-    votingEndsAt: meeting.votingEndsAt,
-    players: room.playerList.map(publicPlayer),
-  });
-}
-
-function aliveVoters(room) {
-  return room.playerList.filter((p) => p.isAlive);
-}
-
-function maybeResolveMeetingEarly(room) {
-  if (!room.meeting || room.gameState !== GameState.MEETING) return;
-  if (now() < room.meeting.votingStartsAt) return;
-
-  const voters = aliveVoters(room);
-  const everyAlivePlayerVoted = voters.every((player) => room.meeting.votes.has(player.socketId));
-  if (everyAlivePlayerVoted) {
-    resolveMeeting(room);
-  }
-}
-
-function resolveMeeting(room) {
-  if (room.gameState !== GameState.MEETING || !room.meeting) return;
-
-  const meeting = room.meeting;
-  clearMeetingTimer(room);
-
-  const tally = new Map();
-  for (const target of meeting.votes.values()) {
-    tally.set(target, (tally.get(target) || 0) + 1);
-  }
-
-  let maxVotes = 0;
-  for (const count of tally.values()) {
-    maxVotes = Math.max(maxVotes, count);
-  }
-
-  const leaders = [...tally.entries()]
-    .filter(([, count]) => count === maxVotes && maxVotes > 0)
-    .map(([target]) => target);
-
-  const isTie = leaders.length > 1;
-  const skipWon = leaders.length === 1 && leaders[0] === 'SKIP';
-  let ejected = null;
-
-  if (!isTie && !skipWon && leaders.length === 1) {
-    const targetSocketId = leaders[0];
-    const target = room.playerList.find((p) => p.socketId === targetSocketId && p.isAlive);
-
-    if (target) {
-      target.isAlive = false;
-      target.input = { up: false, down: false, left: false, right: false };
-      removeOutstandingTasksForDeadCrew(room, target);
-      ejected = {
-        ...publicPlayer(target),
-        wasImpostor: target.isImpostor,
-      };
-    }
-  }
-
-  const result = {
-    meetingId: meeting.id,
-    ejected,
-    isTie,
-    skipWon,
-    tally: Object.fromEntries(tally),
-  };
-
-  room.meeting = null;
-  room.bodies = [];
-
-  room.playerList.forEach((player, index) => {
-    if (player.isAlive) {
-      const spawn = SPAWN_POINTS[index % SPAWN_POINTS.length] || MAP.spawn;
-      player.currentX = spawn.x;
-      player.currentY = spawn.y;
-      player.killCooldownUntil = now() + INITIAL_KILL_COOLDOWN_MS;
-    }
-    player.input = { up: false, down: false, left: false, right: false };
-    player.inVent = false;
-    player.currentVentId = null;
-  });
-
-  io.to(room.roomCode).emit('meetingEnded', result);
-  emitTaskProgress(room);
-
-  room.gameState = GameState.PLAYING;
-  touchRoom(room);
-
-  if (!checkWinConditions(room)) {
-    io.to(room.roomCode).emit('gameResumed', {
-      players: room.playerList.map(publicPlayer),
-      taskProgress: getTaskProgress(room),
-    });
-  }
-}
-
-function resetRoomToLobby(room) {
-  clearMeetingTimer(room);
-  room.gameState = GameState.LOBBY;
-  room.tasksCompleted = 0;
-  room.totalTasks = 0;
-  room.bodies = [];
-  room.meeting = null;
-  room.winner = null;
-  room.gameOverReason = null;
-
-  room.playerList.forEach((player, index) => {
-    const spawn = SPAWN_POINTS[index % SPAWN_POINTS.length] || MAP.spawn;
-    player.isImpostor = false;
-    player.isAlive = true;
-    player.currentX = spawn.x;
-    player.currentY = spawn.y;
-    player.input = { up: false, down: false, left: false, right: false };
-    player.tasks = [];
-    player.inVent = false;
-    player.currentVentId = null;
-    player.killCooldownUntil = 0;
-    player.emergencyMeetingsRemaining = EMERGENCY_MEETINGS_PER_PLAYER;
-  });
-
-  touchRoom(room);
-}
-
-function registerAck(socket, eventName, handler) {
-  socket.on(eventName, async (...args) => {
-    const maybeAck = args[args.length - 1];
-    const ack = typeof maybeAck === 'function' ? args.pop() : null;
-
-    try {
-      const result = await handler(...args);
-      if (ack) ack({ ok: true, ...(result || {}) });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unexpected server error.';
-      const code = error && error.code ? error.code : 'SERVER_ERROR';
-
-      if (ack) {
-        ack({ ok: false, error: message, code });
-      } else {
-        socket.emit('serverError', { error: message, code });
-      }
-
-      if (!(error instanceof GameError)) {
-        console.error(`[${eventName}]`, error);
-      }
-    }
-  });
-}
-
-function removeSocketFromCurrentRoom(socket, reason = 'left') {
-  const roomCode = socket.data.roomCode;
-  if (!roomCode) return;
-
-  const room = rooms.get(roomCode);
-  socket.data.roomCode = null;
-
+function leaveRoom(socket) {
+  const code = socketRoom.get(socket.id);
+  if (!code) return;
+  const room = rooms.get(code);
+  socketRoom.delete(socket.id);
+  socket.leave(code);
   if (!room) return;
-
-  const playerIndex = room.playerList.findIndex((p) => p.socketId === socket.id);
-  if (playerIndex === -1) return;
-
-  const [leavingPlayer] = room.playerList.splice(playerIndex, 1);
-
-  if (!leavingPlayer.isImpostor && leavingPlayer.isAlive) {
-    // Preserve already-completed task credit, but remove work that can no longer
-    // be completed after this player disconnects.
-    removeOutstandingTasksForDeadCrew(room, leavingPlayer);
+  const p = room.players.get(socket.id);
+  room.players.delete(socket.id);
+  if (room.players.size === 0) { destroyRoom(room); return; }
+  io.to(code).emit('playerLeft', { socketId: socket.id, name: p?.name || 'Player' });
+  if (room.hostId === socket.id) {
+    room.hostId = room.players.keys().next().value;
+    io.to(code).emit('hostChanged', { hostSocketId: room.hostId });
   }
+  if (room.state === 'Lobby') broadcastRoom(room);
+  else if (room.state === 'Meeting') { if (room.meeting?.votes) room.meeting.votes.delete(socket.id); sendVoteStatus(room); maybeEndEarly(room); checkWin(room); }
+  else checkWin(room);
+}
 
-  if (room.meeting) {
-    room.meeting.votes.delete(leavingPlayer.socketId);
-    for (const [voter, target] of room.meeting.votes.entries()) {
-      if (target === leavingPlayer.socketId) {
-        room.meeting.votes.delete(voter);
-      }
-    }
-  }
+function destroyRoom(room) {
+  clearInterval(room.tick);
+  for (const t of room.timers) clearTimeout(t);
+  rooms.delete(room.code);
+}
 
-  if (room.playerList.length === 0) {
-    clearMeetingTimer(room);
-    rooms.delete(room.roomCode);
-    return;
-  }
+const later = (room, fn, ms) => { const t = setTimeout(() => { room.timers.delete(t); fn(); }, ms); room.timers.add(t); return t; };
 
-  if (room.hostSocketId === leavingPlayer.socketId) {
-    room.hostSocketId = room.playerList[0].socketId;
-    io.to(room.roomCode).emit('hostChanged', { hostSocketId: room.hostSocketId });
-  }
+/* ---------------------------------------------------------------------------
+   Game start
+   --------------------------------------------------------------------------- */
+function startGame(socket, cb) {
+  const room = rooms.get(socketRoom.get(socket.id));
+  if (!room) return fail(cb, 'You are not in a room.');
+  if (room.hostId !== socket.id) return fail(cb, 'Only the host can start.');
+  if (room.state !== 'Lobby') return fail(cb, 'Game already running.');
+  if (room.players.size < MIN_PLAYERS) return fail(cb, `Need at least ${MIN_PLAYERS} players.`);
+  if (room.impostorCount >= Math.floor(room.players.size / 2)) return fail(cb, 'Too many impostors for this many players.');
+  ok(cb);
 
-  touchRoom(room);
-
-  io.to(room.roomCode).emit('playerLeft', {
-    socketId: leavingPlayer.socketId,
-    reason,
+  room.map = Maps.buildMap(room.mapId);
+  room.nav = Maps.buildNav(room.map._walkable);
+  room.state = 'Playing';
+  room.bodies = [];
+  room.taskDone = 0;
+  room.tasks = new Map();
+  const players = [...room.players.values()];
+  players.forEach(p => { p.isAlive = true; p.isImpostor = false; p.inVent = null; p.input = { up: false, down: false, left: false, right: false }; });
+  shuffle(players).slice(0, room.impostorCount).forEach(p => { p.isImpostor = true; });
+  players.forEach((p, i) => {
+    const a = (i / players.length) * Math.PI * 2;
+    p.x = room.map.spawn.x + Math.cos(a) * 150;
+    p.y = room.map.spawn.y + Math.sin(a) * 100;
   });
+  room.taskTotal = 0;
+  for (const p of players) {
+    if (p.isImpostor) continue;
+    const spots = shuffle(room.map._taskSpots).slice(0, TASKS_PER_PLAYER).map(t => ({ ...t, completed: false }));
+    room.tasks.set(p.socketId, spots);
+    room.taskTotal += spots.length;
+  }
+  const now = Date.now();
+  const firstCooldown = KILL_COOLDOWN_MS * 0.6;
+  players.forEach(p => { p.killCooldownUntil = now + firstCooldown; });
 
-  io.to(room.roomCode).emit('roomUpdated', publicRoomState(room));
-  emitTaskProgress(room);
+  const teammates = players.filter(p => p.isImpostor).map(p => ({ socketId: p.socketId, name: p.name }));
+  const mapPayload = { width: room.map.width, height: room.map.height, name: room.map.name, spawn: room.map.spawn, rooms: room.map.rooms, collisionRects: [], taskLocations: room.map.taskLocations, vents: room.map.vents, emergencyButton: room.map.emergencyButton };
+  for (const p of players) {
+    io.to(p.socketId).emit('gameStarted', {
+      roomCode: room.code,
+      role: p.isImpostor ? 'Impostor' : 'Crewmate',
+      teammates: p.isImpostor ? teammates : [],
+      tasks: (room.tasks.get(p.socketId) || []).map(t => ({ id: t.id, name: t.name, room: t.room, type: t.type, x: t.x, y: t.y, completed: false })),
+      players: players.map(q => ({ ...publicPlayer(q), x: q.x, y: q.y })),
+      map: mapPayload,
+      killCooldownMs: firstCooldown,
+      taskProgress: 0,
+    });
+  }
+  room.lastTick = Date.now();
+  clearInterval(room.tick);
+  room.tick = setInterval(() => tick(room), 1000 / TICK_HZ);
+}
 
-  if ([GameState.PLAYING, GameState.MEETING].includes(room.gameState)) {
-    if (!checkWinConditions(room) && room.gameState === GameState.MEETING) {
-      maybeResolveMeetingEarly(room);
-    }
+/* ---------------------------------------------------------------------------
+   Movement + snapshots
+   --------------------------------------------------------------------------- */
+function tryMove(room, p, dx, dy) {
+  if (!p.isAlive) { p.x = Math.max(0, Math.min(room.map.width, p.x + dx)); p.y = Math.max(0, Math.min(room.map.height, p.y + dy)); return; }
+  if (room.nav.walkableAt({ x: p.x + dx, y: p.y + dy })) { p.x += dx; p.y += dy; return; }
+  if (room.nav.walkableAt({ x: p.x + dx, y: p.y })) { p.x += dx; return; }
+  if (room.nav.walkableAt({ x: p.x, y: p.y + dy })) p.y += dy;
+}
+
+function tick(room) {
+  const now = Date.now();
+  const dt = Math.min(.1, (now - room.lastTick) / 1000);
+  room.lastTick = now;
+  if (room.state !== 'Playing') return;
+  for (const p of room.players.values()) {
+    if (p.inVent) continue;
+    const dx = (p.input.right ? 1 : 0) - (p.input.left ? 1 : 0);
+    const dy = (p.input.down ? 1 : 0) - (p.input.up ? 1 : 0);
+    if (dx || dy) { const l = Math.hypot(dx, dy); tryMove(room, p, dx / l * SPEED * dt, dy / l * SPEED * dt); }
+  }
+  const all = [...room.players.values()];
+  const bodies = room.bodies.map(publicBody);
+  const progress = room.taskTotal ? room.taskDone / room.taskTotal : 0;
+  for (const me of all) {
+    const meDead = !me.isAlive;
+    const players = all
+      .filter(p => p === me || (!p.inVent && (meDead || p.isAlive)))
+      .map(p => ({ ...publicPlayer(p), x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 }));
+    io.to(me.socketId).emit('worldSnapshot', { gameState: room.state, taskProgress: progress, bodies, players });
   }
 }
 
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    rooms: rooms.size,
-    uptimeSeconds: Math.floor(process.uptime()),
+/* ---------------------------------------------------------------------------
+   Actions
+   --------------------------------------------------------------------------- */
+function withGame(socket, cb, fn) {
+  const room = rooms.get(socketRoom.get(socket.id));
+  if (!room) return fail(cb, 'You are not in a room.');
+  const me = room.players.get(socket.id);
+  if (!me) return fail(cb, 'Player not found.');
+  return fn(room, me);
+}
+
+function killPlayer(socket, payload, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (room.state !== 'Playing') return fail(cb, 'Not in play.');
+    const target = room.players.get(payload?.targetSocketId);
+    if (!me.isImpostor || !me.isAlive) return fail(cb, 'Only impostors can kill.');
+    if (!target || !target.isAlive || target.isImpostor) return fail(cb, 'Invalid target.');
+    if (Date.now() < me.killCooldownUntil) return fail(cb, 'Kill is on cooldown.');
+    if (dist(me, target) > KILL_RANGE + 10) return fail(cb, 'Too far away.');
+    if (me.inVent) return fail(cb, 'Leave the vent first.');
+    doKill(room, me, target);
+    ok(cb, { cooldownUntil: me.killCooldownUntil });
   });
-});
+}
 
-app.get('/api/rooms/:roomCode', (req, res) => {
-  const roomCode = normalizeRoomCode(req.params.roomCode);
-  const room = rooms.get(roomCode);
-
-  if (!room) {
-    return res.status(404).json({ ok: false, error: 'Room not found.' });
+function doKill(room, killer, victim) {
+  const now = Date.now();
+  victim.isAlive = false;
+  killer.killCooldownUntil = now + KILL_COOLDOWN_MS;
+  const body = { id: `body-${victim.socketId}-${now}`, x: victim.x, y: victim.y, victimSocketId: victim.socketId, victimName: victim.name, victimColorHex: victim.colorHex, room: roomOf(room, victim), at: now };
+  room.bodies.push(body);
+  io.to(victim.socketId).emit('playerKilled', { body: publicBody(body) });
+  io.to(victim.socketId).emit('youWereKilled', { killer: { socketId: killer.socketId, name: killer.name } });
+  for (const p of room.players.values()) {
+    if (p === victim) continue;
+    if (dist(p, body) <= VIEW_RANGE || roomOf(room, p) === body.room) io.to(p.socketId).emit('playerKilled', { body: publicBody(body) });
   }
+  checkWin(room);
+}
 
-  return res.json({ ok: true, room: publicRoomState(room) });
+function taskComplete(socket, payload, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (room.state !== 'Playing') return fail(cb, 'Not in play.');
+    const t = (room.tasks.get(me.socketId) || []).find(x => x.id === payload?.taskId);
+    if (!t) return fail(cb, 'Unknown task.');
+    if (me.isAlive && dist(me, t) > 130) return fail(cb, 'Move closer to the task.');
+    if (!t.completed) {
+      t.completed = true;
+      room.taskDone += 1;
+      io.to(me.socketId).emit('yourTaskCompleted', { taskId: t.id });
+      io.to(room.code).emit('taskProgress', { progress: room.taskDone / room.taskTotal, completed: room.taskDone, total: room.taskTotal });
+    }
+    ok(cb);
+    checkWin(room);
+  });
+}
+
+function ventAction(socket, payload, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (room.state !== 'Playing') return fail(cb, 'Not in play.');
+    if (!me.isImpostor || !me.isAlive) return fail(cb, 'Only impostors can vent.');
+    const vents = room.map.vents;
+    if (payload?.action === 'enter') {
+      const v = vents.find(x => x.id === payload.ventId);
+      if (!v || dist(me, v) > 100) return fail(cb, 'No vent here.');
+      me.inVent = v.id; me.x = v.x; me.y = v.y;
+      return ok(cb, { inVent: true, currentVentId: v.id });
+    }
+    if (payload?.action === 'travel') {
+      const from = vents.find(x => x.id === me.inVent);
+      const to = vents.find(x => x.id === payload.ventId);
+      if (!from || !to || !from.connections.includes(to.id)) return fail(cb, 'Not connected.');
+      me.inVent = to.id; me.x = to.x; me.y = to.y;
+      return ok(cb, { inVent: true, currentVentId: to.id });
+    }
+    const v = vents.find(x => x.id === me.inVent);
+    me.inVent = null;
+    if (v) { me.x = v.x; me.y = v.y + 30; }
+    ok(cb, { inVent: false, currentVentId: null });
+  });
+}
+
+function reportBody(socket, payload, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (room.state !== 'Playing') return fail(cb, 'Not in play.');
+    const body = room.bodies.find(b => b.id === payload?.bodyId);
+    if (!me.isAlive) return fail(cb, 'Ghosts cannot report.');
+    if (!body || dist(me, body) > 150) return fail(cb, 'No body nearby.');
+    ok(cb);
+    startMeeting(room, { type: 'body', reporter: me, body });
+  });
+}
+
+function emergencyMeeting(socket, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (room.state !== 'Playing') return fail(cb, 'Not in play.');
+    if (!me.isAlive) return fail(cb, 'Ghosts cannot call meetings.');
+    if (dist(me, room.map.emergencyButton) > 110) return fail(cb, 'Go to the emergency button.');
+    ok(cb);
+    startMeeting(room, { type: 'emergency', reporter: me });
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   Meetings
+   --------------------------------------------------------------------------- */
+function startMeeting(room, trigger) {
+  if (room.state !== 'Playing' || room.meeting) return;
+  room.state = 'Meeting';
+  const now = Date.now();
+  room.meeting = { trigger, votes: new Map(), votingStartsAt: now + DISCUSSION_MS, votingEndsAt: now + DISCUSSION_MS + VOTING_MS, ended: false };
+  room.bodies = [];
+  const players = [...room.players.values()];
+  players.forEach((p, i) => {
+    p.inVent = null;
+    p.input = { up: false, down: false, left: false, right: false };
+    const a = (i / players.length) * Math.PI * 2;
+    p.x = room.map.spawn.x + Math.cos(a) * 150; p.y = room.map.spawn.y + Math.sin(a) * 100;
+  });
+  io.to(room.code).emit('meetingStarted', {
+    trigger: { type: trigger.type, reporter: { socketId: trigger.reporter.socketId, name: trigger.reporter.name, colorHex: trigger.reporter.colorHex }, body: trigger.body ? publicBody(trigger.body) : null },
+    players: players.map(publicPlayer),
+    votingStartsAt: room.meeting.votingStartsAt,
+    votingEndsAt: room.meeting.votingEndsAt,
+  });
+  sendVoteStatus(room);
+  later(room, () => endMeeting(room), DISCUSSION_MS + VOTING_MS + 200);
+}
+
+function meetingChat(socket, payload, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (!room.meeting || room.meeting.ended) return fail(cb, 'No meeting running.');
+    if (!me.isAlive) return fail(cb, 'Ghosts cannot chat.');
+    const message = String(payload?.message || '').slice(0, 200).trim();
+    if (!message) return fail(cb, 'Empty message.');
+    io.to(room.code).emit('chatMessage', { sender: { socketId: me.socketId, name: me.name, colorHex: me.colorHex }, message, at: Date.now() });
+    ok(cb);
+  });
+}
+
+function castVote(socket, payload, cb) {
+  withGame(socket, cb, (room, me) => {
+    if (!room.meeting || room.meeting.ended) return fail(cb, 'No meeting running.');
+    if (Date.now() < room.meeting.votingStartsAt) return fail(cb, 'Voting has not started.');
+    if (!me.isAlive) return fail(cb, 'Ghosts cannot vote.');
+    if (room.meeting.votes.has(me.socketId)) return fail(cb, 'You already voted.');
+    const target = payload?.targetSocketId ? room.players.get(payload.targetSocketId) : null;
+    if (payload?.targetSocketId && (!target || !target.isAlive)) return fail(cb, 'Invalid vote.');
+    room.meeting.votes.set(me.socketId, target ? target.socketId : null);
+    ok(cb);
+    sendVoteStatus(room);
+    maybeEndEarly(room);
+  });
+}
+
+function sendVoteStatus(room) {
+  if (!room.meeting) return;
+  io.to(room.code).emit('voteStatus', { votedCount: room.meeting.votes.size, voterCount: alive(room).length });
+}
+
+function maybeEndEarly(room) {
+  if (room.meeting && !room.meeting.ended && room.meeting.votes.size >= alive(room).length) later(room, () => endMeeting(room), 900);
+}
+
+function endMeeting(room) {
+  if (!room.meeting || room.meeting.ended) return;
+  room.meeting.ended = true;
+  const tally = new Map();
+  let skips = 0;
+  for (const v of room.meeting.votes.values()) { if (v === null) skips++; else tally.set(v, (tally.get(v) || 0) + 1); }
+  let top = null, topCount = 0, tie = false;
+  for (const [id, c] of tally) { if (c > topCount) { top = id; topCount = c; tie = false; } else if (c === topCount) tie = true; }
+  let ejected = null, isTie = false, skipped = false;
+  if (top && topCount > skips && !tie) {
+    const p = room.players.get(top);
+    if (p) { p.isAlive = false; ejected = { socketId: p.socketId, name: p.name, colorHex: p.colorHex, wasImpostor: p.isImpostor }; }
+  } else if (top && (tie || topCount === skips)) isTie = true;
+  else skipped = true;
+  io.to(room.code).emit('meetingEnded', { ejected, isTie, skipped, votes: [...room.meeting.votes.entries()].map(([voter, target]) => ({ voter, target })) });
+  later(room, () => {
+    room.meeting = null;
+    if (checkWin(room)) return;
+    room.state = 'Playing';
+    const now = Date.now();
+    for (const p of room.players.values()) p.killCooldownUntil = now + KILL_COOLDOWN_MS * 0.7;
+    io.to(room.code).emit('gameResumed', { taskProgress: room.taskTotal ? room.taskDone / room.taskTotal : 0 });
+  }, EJECT_MS);
+}
+
+/* ---------------------------------------------------------------------------
+   Win conditions / lobby return
+   --------------------------------------------------------------------------- */
+function checkWin(room) {
+  if (room.state === 'Lobby' || room.state === 'Ended') return room.state === 'Ended';
+  const imps = alive(room).filter(p => p.isImpostor).length;
+  const crew = alive(room).filter(p => !p.isImpostor).length;
+  let winner = null, reason = '';
+  if (room.taskTotal && room.taskDone >= room.taskTotal) { winner = 'Crewmates'; reason = 'All tasks were completed.'; }
+  else if (imps === 0) { winner = 'Crewmates'; reason = 'Every impostor was ejected.'; }
+  else if (imps >= crew) { winner = 'Impostors'; reason = 'The impostors outnumber the crew.'; }
+  if (!winner) return false;
+  room.state = 'Ended';
+  clearInterval(room.tick); room.tick = null;
+  const wasMeeting = Boolean(room.meeting);
+  later(room, () => io.to(room.code).emit('gameOver', { winner, reason, players: [...room.players.values()].map(p => ({ ...publicPlayer(p), isImpostor: p.isImpostor })) }), wasMeeting ? 400 : 900);
+  return true;
+}
+
+function returnToLobby(socket, cb) {
+  withGame(socket, cb, (room) => {
+    if (room.hostId !== socket.id) return fail(cb, 'Only the host can return everyone to the lobby.');
+    ok(cb);
+    room.state = 'Lobby';
+    room.meeting = null;
+    room.bodies = [];
+    clearInterval(room.tick); room.tick = null;
+    for (const t of room.timers) clearTimeout(t);
+    room.timers.clear();
+    for (const p of room.players.values()) { p.isAlive = true; p.isImpostor = false; p.inVent = null; }
+    io.to(room.code).emit('returnedToLobby', roomPayload(room));
+  });
+}
+
+/* ---------------------------------------------------------------------------
+   Socket wiring
+   --------------------------------------------------------------------------- */
+io.on('connection', socket => {
+  socket.on('createRoom', (payload, cb) => createRoom(socket, payload, cb));
+  socket.on('getRoomInfo', (payload, cb) => {
+    const room = rooms.get(String(payload?.roomCode || '').toUpperCase());
+    if (!room) return fail(cb, 'Room not found.');
+    ok(cb, { room: { ...roomPayload(room), takenPlayerNumbers: [...room.players.values()].map(p => p.number) } });
+  });
+  socket.on('joinRoom', (payload, cb) => joinRoom(socket, payload, cb));
+  socket.on('setImpostorCount', (payload, cb) => withGame(socket, cb, (room) => {
+    if (room.hostId !== socket.id) return fail(cb, 'Only the host can change that.');
+    if (room.state !== 'Lobby') return fail(cb, 'Game already running.');
+    room.impostorCount = Math.max(1, Math.min(3, Number(payload?.count) || 1));
+    ok(cb, { room: roomPayload(room) });
+    broadcastRoom(room);
+  }));
+  socket.on('setMap', (payload, cb) => withGame(socket, cb, (room) => {
+    if (room.hostId !== socket.id) return fail(cb, 'Only the host can change the map.');
+    if (room.state !== 'Lobby') return fail(cb, 'Game already running.');
+    if (!Maps.MAPS[payload?.mapId]) return fail(cb, 'Unknown map.');
+    room.mapId = payload.mapId;
+    ok(cb, { room: roomPayload(room) });
+    broadcastRoom(room);
+  }));
+  socket.on('startGame', cb => startGame(socket, cb));
+  socket.on('playerInput', payload => {
+    const room = rooms.get(socketRoom.get(socket.id));
+    const me = room?.players.get(socket.id);
+    if (me) me.input = { up: !!payload?.up, down: !!payload?.down, left: !!payload?.left, right: !!payload?.right };
+  });
+  socket.on('killPlayer', (payload, cb) => killPlayer(socket, payload, cb));
+  socket.on('taskComplete', (payload, cb) => taskComplete(socket, payload, cb));
+  socket.on('ventAction', (payload, cb) => ventAction(socket, payload, cb));
+  socket.on('reportBody', (payload, cb) => reportBody(socket, payload, cb));
+  socket.on('emergencyMeeting', cb => emergencyMeeting(socket, cb));
+  socket.on('meetingChat', (payload, cb) => meetingChat(socket, payload, cb));
+  socket.on('castVote', (payload, cb) => castVote(socket, payload, cb));
+  socket.on('returnToLobby', cb => returnToLobby(socket, cb));
+  socket.on('leaveRoom', cb => { leaveRoom(socket); ok(cb); });
+  socket.on('disconnect', () => leaveRoom(socket));
 });
 
-io.on('connection', (socket) => {
-  socket.data.roomCode = null;
-
-  registerAck(socket, 'createRoom', (payload = {}) => {
-    if (socket.data.roomCode) {
-      throw new GameError('Leave your current room first.', 'ALREADY_IN_ROOM');
-    }
-
-    const room = createRoom(socket.id, payload);
-    socket.data.roomCode = room.roomCode;
-    socket.join(room.roomCode);
-
-    socket.emit('roomUpdated', publicRoomState(room));
-
-    return {
-      room: publicRoomState(room),
-      you: publicPlayer(getPlayer(room, socket.id)),
-    };
-  });
-
-  registerAck(socket, 'getRoomInfo', (payload = {}) => {
-    const roomCode = normalizeRoomCode(payload.roomCode);
-    const room = rooms.get(roomCode);
-
-    if (!room) {
-      throw new GameError('Room not found.', 'ROOM_NOT_FOUND');
-    }
-
-    return { room: publicRoomState(room) };
-  });
-
-  registerAck(socket, 'joinRoom', (payload = {}) => {
-    if (socket.data.roomCode) {
-      throw new GameError('Leave your current room first.', 'ALREADY_IN_ROOM');
-    }
-
-    const roomCode = normalizeRoomCode(payload.roomCode);
-    const room = rooms.get(roomCode);
-
-    if (!room) {
-      throw new GameError('Room not found.', 'ROOM_NOT_FOUND');
-    }
-
-    const player = addPlayerToRoom(room, socket.id, payload);
-    socket.data.roomCode = room.roomCode;
-    socket.join(room.roomCode);
-
-    io.to(room.roomCode).emit('roomUpdated', publicRoomState(room));
-
-    return {
-      room: publicRoomState(room),
-      you: publicPlayer(player),
-    };
-  });
-
-  registerAck(socket, 'setImpostorCount', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertHost(room, socket.id);
-    assertGameState(room, GameState.LOBBY);
-
-    const count = Number(payload.count);
-    if (!Number.isInteger(count) || count < 1 || count > 3) {
-      throw new GameError('Impostor count must be 1, 2, or 3.', 'INVALID_IMPOSTOR_COUNT');
-    }
-
-    room.impostorCount = count;
-    touchRoom(room);
-    io.to(room.roomCode).emit('roomUpdated', publicRoomState(room));
-    return { room: publicRoomState(room) };
-  });
-
-  registerAck(socket, 'startGame', () => {
-    const room = getRoomForSocket(socket);
-    assertHost(room, socket.id);
-    assertGameState(room, GameState.LOBBY);
-
-    startGame(room);
-
-    const impostorTeammates = room.playerList.filter((p) => p.isImpostor).map(publicPlayer);
-
-    for (const player of room.playerList) {
-      io.to(player.socketId).emit('gameStarted', {
-        roomCode: room.roomCode,
-        gameState: room.gameState,
-        map: sanitizeMapForClient(),
-        players: room.playerList.map(publicPlayer),
-        role: player.isImpostor ? 'Impostor' : 'Crewmate',
-        teammates: player.isImpostor ? impostorTeammates : [],
-        tasks: player.tasks.map(({ isFake, ...task }) => task),
-        taskProgress: getTaskProgress(room),
-        killCooldownMs: KILL_COOLDOWN_MS,
-      });
-    }
-
-    io.to(room.roomCode).emit('roomUpdated', publicRoomState(room));
-    return { started: true };
-  });
-
-  socket.on('playerInput', (payload = {}) => {
-    try {
-      const room = getRoomForSocket(socket);
-      if (room.gameState !== GameState.PLAYING) return;
-
-      const player = getPlayer(room, socket.id);
-      if (!player.isAlive || player.inVent) return;
-
-      player.input = {
-        up: payload.up === true,
-        down: payload.down === true,
-        left: payload.left === true,
-        right: payload.right === true,
-      };
-    } catch {
-      // High-frequency input deliberately fails silently.
-    }
-  });
-
-  registerAck(socket, 'killPlayer', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.PLAYING);
-
-    const killer = getPlayer(room, socket.id);
-    if (!killer.isAlive || !killer.isImpostor || killer.inVent) {
-      throw new GameError('You cannot kill right now.', 'KILL_NOT_ALLOWED');
-    }
-
-    if (now() < killer.killCooldownUntil) {
-      throw new GameError('Kill is still on cooldown.', 'KILL_COOLDOWN');
-    }
-
-    const target = room.playerList.find((p) => p.socketId === payload.targetSocketId);
-    if (!target || !target.isAlive || target.isImpostor || target.inVent) {
-      throw new GameError('Invalid kill target.', 'INVALID_KILL_TARGET');
-    }
-
-    const d = distance(killer.currentX, killer.currentY, target.currentX, target.currentY);
-    if (d > KILL_RADIUS) {
-      throw new GameError('Target is out of kill range.', 'OUT_OF_RANGE');
-    }
-
-    target.isAlive = false;
-    target.input = { up: false, down: false, left: false, right: false };
-    killer.killCooldownUntil = now() + KILL_COOLDOWN_MS;
-    removeOutstandingTasksForDeadCrew(room, target);
-
-    const body = {
-      id: crypto.randomUUID(),
-      victimSocketId: target.socketId,
-      victimName: target.name,
-      victimNumber: target.number,
-      victimColor: target.color,
-      victimColorHex: target.colorHex,
-      x: target.currentX,
-      y: target.currentY,
-      reported: false,
-      createdAt: now(),
-    };
-
-    room.bodies.push(body);
-    touchRoom(room);
-
-    io.to(target.socketId).emit('youWereKilled', { body: serializeBody(body) });
-    io.to(room.roomCode).emit('playerKilled', { body: serializeBody(body) });
-    emitTaskProgress(room);
-    checkWinConditions(room);
-
-    return { killed: true, cooldownUntil: killer.killCooldownUntil };
-  });
-
-  registerAck(socket, 'taskComplete', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.PLAYING);
-
-    const player = getPlayer(room, socket.id);
-    if (!player.isAlive || player.isImpostor || player.inVent) {
-      throw new GameError('You cannot complete tasks right now.', 'TASK_NOT_ALLOWED');
-    }
-
-    const task = player.tasks.find((t) => t.id === payload.taskId);
-    if (!task) {
-      throw new GameError('Task is not assigned to this player.', 'INVALID_TASK');
-    }
-    if (task.completed) {
-      throw new GameError('Task is already complete.', 'TASK_ALREADY_COMPLETE');
-    }
-
-    const d = distance(player.currentX, player.currentY, task.x, task.y);
-    if (d > TASK_RADIUS) {
-      throw new GameError('Move closer to the task console.', 'OUT_OF_RANGE');
-    }
-
-    task.completed = true;
-    room.tasksCompleted += 1;
-    touchRoom(room);
-
-    socket.emit('yourTaskCompleted', { taskId: task.id });
-    emitTaskProgress(room);
-    checkWinConditions(room);
-
-    return {
-      taskId: task.id,
-      completed: room.tasksCompleted,
-      total: room.totalTasks,
-      progress: getTaskProgress(room),
-    };
-  });
-
-  registerAck(socket, 'ventAction', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.PLAYING);
-
-    const player = getPlayer(room, socket.id);
-    if (!player.isAlive || !player.isImpostor) {
-      throw new GameError('Only living impostors can use vents.', 'VENT_NOT_ALLOWED');
-    }
-
-    const action = String(payload.action || '');
-    const vent = getVent(payload.ventId);
-    if (!vent) {
-      throw new GameError('Vent not found.', 'INVALID_VENT');
-    }
-
-    if (action === 'enter') {
-      if (player.inVent) {
-        throw new GameError('You are already in a vent.', 'ALREADY_IN_VENT');
-      }
-
-      if (distance(player.currentX, player.currentY, vent.x, vent.y) > VENT_RADIUS) {
-        throw new GameError('Move closer to the vent.', 'OUT_OF_RANGE');
-      }
-
-      player.inVent = true;
-      player.currentVentId = vent.id;
-      player.currentX = vent.x;
-      player.currentY = vent.y;
-      player.input = { up: false, down: false, left: false, right: false };
-    } else if (action === 'travel') {
-      if (!player.inVent || !player.currentVentId) {
-        throw new GameError('Enter a vent first.', 'NOT_IN_VENT');
-      }
-
-      const currentVent = getVent(player.currentVentId);
-      if (!currentVent || !currentVent.connections.includes(vent.id)) {
-        throw new GameError('Those vents are not connected.', 'VENT_NOT_CONNECTED');
-      }
-
-      player.currentVentId = vent.id;
-      player.currentX = vent.x;
-      player.currentY = vent.y;
-    } else if (action === 'exit') {
-      if (!player.inVent || player.currentVentId !== vent.id) {
-        throw new GameError('You can only exit from your current vent.', 'INVALID_VENT_EXIT');
-      }
-
-      player.inVent = false;
-      player.currentVentId = null;
-      player.currentX = vent.x;
-      player.currentY = vent.y;
-    } else {
-      throw new GameError('Vent action must be enter, travel, or exit.', 'INVALID_VENT_ACTION');
-    }
-
-    touchRoom(room);
-
-    return {
-      inVent: player.inVent,
-      currentVentId: player.currentVentId,
-      x: player.currentX,
-      y: player.currentY,
-    };
-  });
-
-  registerAck(socket, 'reportBody', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.PLAYING);
-
-    const reporter = getPlayer(room, socket.id);
-    if (!reporter.isAlive || reporter.inVent) {
-      throw new GameError('You cannot report right now.', 'REPORT_NOT_ALLOWED');
-    }
-
-    let body = null;
-    if (payload.bodyId) {
-      body = room.bodies.find((b) => b.id === payload.bodyId && !b.reported);
-    } else {
-      body = room.bodies
-        .filter((b) => !b.reported)
-        .sort(
-          (a, b) =>
-            distance(reporter.currentX, reporter.currentY, a.x, a.y) -
-            distance(reporter.currentX, reporter.currentY, b.x, b.y)
-        )[0];
-    }
-
-    if (!body) {
-      throw new GameError('No reportable body found.', 'BODY_NOT_FOUND');
-    }
-
-    if (distance(reporter.currentX, reporter.currentY, body.x, body.y) > REPORT_RADIUS) {
-      throw new GameError('Move closer to the body.', 'OUT_OF_RANGE');
-    }
-
-    body.reported = true;
-
-    beginMeeting(room, {
-      type: 'body',
-      reporter: publicPlayer(reporter),
-      body: serializeBody(body),
-    });
-
-    return { meetingStarted: true };
-  });
-
-  registerAck(socket, 'emergencyMeeting', () => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.PLAYING);
-
-    const player = getPlayer(room, socket.id);
-    if (!player.isAlive || player.inVent) {
-      throw new GameError('You cannot call an emergency meeting right now.', 'MEETING_NOT_ALLOWED');
-    }
-
-    if (player.emergencyMeetingsRemaining <= 0) {
-      throw new GameError('You have no emergency meetings remaining.', 'NO_EMERGENCY_MEETINGS');
-    }
-
-    if (
-      distance(
-        player.currentX,
-        player.currentY,
-        MAP.emergencyButton.x,
-        MAP.emergencyButton.y
-      ) > EMERGENCY_RADIUS
-    ) {
-      throw new GameError('Move closer to the emergency button.', 'OUT_OF_RANGE');
-    }
-
-    player.emergencyMeetingsRemaining -= 1;
-
-    beginMeeting(room, {
-      type: 'emergency',
-      reporter: publicPlayer(player),
-    });
-
-    return {
-      meetingStarted: true,
-      emergencyMeetingsRemaining: player.emergencyMeetingsRemaining,
-    };
-  });
-
-  registerAck(socket, 'meetingChat', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.MEETING);
-
-    const player = getPlayer(room, socket.id);
-    const raw = typeof payload.message === 'string' ? payload.message : '';
-    const message = raw.replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, 200);
-
-    if (!message) {
-      throw new GameError('Message cannot be empty.', 'EMPTY_MESSAGE');
-    }
-
-    const chat = {
-      id: crypto.randomUUID(),
-      sender: publicPlayer(player),
-      message,
-      sentAt: now(),
-    };
-
-    io.to(room.roomCode).emit('chatMessage', chat);
-    return { messageId: chat.id };
-  });
-
-  registerAck(socket, 'castVote', (payload = {}) => {
-    const room = getRoomForSocket(socket);
-    assertGameState(room, GameState.MEETING);
-
-    const voter = getPlayer(room, socket.id);
-    if (!voter.isAlive) {
-      throw new GameError('Dead players cannot vote.', 'VOTE_NOT_ALLOWED');
-    }
-
-    if (!room.meeting) {
-      throw new GameError('No meeting is active.', 'NO_MEETING');
-    }
-
-    if (now() < room.meeting.votingStartsAt) {
-      throw new GameError('Voting has not started yet.', 'VOTING_NOT_STARTED');
-    }
-
-    if (room.meeting.votes.has(voter.socketId)) {
-      throw new GameError('You have already voted.', 'ALREADY_VOTED');
-    }
-
-    let target = payload.targetSocketId;
-    if (target === null || target === undefined || target === '' || target === 'SKIP') {
-      target = 'SKIP';
-    } else {
-      const targetPlayer = room.playerList.find((p) => p.socketId === target && p.isAlive);
-      if (!targetPlayer) {
-        throw new GameError('Invalid vote target.', 'INVALID_VOTE_TARGET');
-      }
-    }
-
-    room.meeting.votes.set(voter.socketId, target);
-    touchRoom(room);
-
-    const voterCount = aliveVoters(room).length;
-    io.to(room.roomCode).emit('voteStatus', {
-      votedCount: room.meeting.votes.size,
-      voterCount,
-    });
-
-    maybeResolveMeetingEarly(room);
-    return { voted: true };
-  });
-
-  registerAck(socket, 'returnToLobby', () => {
-    const room = getRoomForSocket(socket);
-    assertHost(room, socket.id);
-    assertGameState(room, GameState.GAME_OVER);
-
-    resetRoomToLobby(room);
-    io.to(room.roomCode).emit('returnedToLobby', publicRoomState(room));
-    io.to(room.roomCode).emit('roomUpdated', publicRoomState(room));
-    return { room: publicRoomState(room) };
-  });
-
-  registerAck(socket, 'leaveRoom', () => {
-    const roomCode = socket.data.roomCode;
-    if (!roomCode) return { left: true };
-
-    socket.leave(roomCode);
-    removeSocketFromCurrentRoom(socket, 'left');
-    return { left: true };
-  });
-
-  socket.on('disconnect', (reason) => {
-    removeSocketFromCurrentRoom(socket, reason || 'disconnected');
-  });
-});
-
-// Authoritative simulation + snapshots.
-const tickMs = 1000 / TICK_RATE;
-let previousTick = now();
-
-setInterval(() => {
-  const currentTick = now();
-  const deltaSeconds = Math.min(0.1, (currentTick - previousTick) / 1000);
-  previousTick = currentTick;
-
-  for (const room of rooms.values()) {
-    if (room.gameState !== GameState.PLAYING) continue;
-
-    for (const player of room.playerList) {
-      movePlayer(player, deltaSeconds);
-    }
-
-    const common = {
-      serverTime: currentTick,
-      gameState: room.gameState,
-      taskProgress: getTaskProgress(room),
-      bodies: room.bodies.filter((body) => !body.reported).map(serializeBody),
-    };
-
-    // Send a per-recipient snapshot so vented players can be omitted from peers.
-    for (const recipient of room.playerList) {
-      const players = room.playerList
-        .filter((player) => {
-          if (!player.isAlive) return false;
-          if (player.socketId === recipient.socketId) return true;
-          return !player.inVent;
-        })
-        .map((player) => ({
-          ...publicPlayer(player),
-          x: Math.round(player.currentX * 10) / 10,
-          y: Math.round(player.currentY * 10) / 10,
-        }));
-
-      io.to(recipient.socketId).emit('worldSnapshot', {
-        ...common,
-        players,
-      });
-    }
-  }
-}, tickMs);
-
-// Cleanup abandoned long-lived rooms.
-setInterval(() => {
-  const cutoff = now() - 2 * 60 * 60 * 1000; // 2 hours
-
-  for (const [roomCode, room] of rooms.entries()) {
-    if (room.playerList.length === 0 || (room.updatedAt < cutoff && room.gameState !== GameState.PLAYING)) {
-      clearMeetingTimer(room);
-      rooms.delete(roomCode);
-    }
-  }
-}, 60_000).unref();
-
-httpServer.listen(PORT, () => {
-  console.log(`Game server listening on http://localhost:${PORT}`);
-  console.log(`Simulation tick rate: ${TICK_RATE} Hz`);
-});
+httpServer.listen(PORT, () => console.log(`Space Party server listening on :${PORT} — maps: ${Maps.MAP_LIST.map(m => m.id).join(', ')}`));
