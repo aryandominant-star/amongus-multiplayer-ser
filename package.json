@@ -1,18 +1,17 @@
 {
-  "name": "space-party-game",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Browser multiplayer social-deduction game backend",
+  "name": "space-party-server",
+  "version": "2.0.0",
+  "description": "Authoritative Socket.IO server for Space Party (multiplayer social deduction) with five selectable maps",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   },
   "dependencies": {
-    "express": "^5.2.1",
-    "socket.io": "^4.8.3"
-  }
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.3"
+  },
+  "license": "MIT"
 }
