@@ -81,6 +81,64 @@
   };
   const MAP_LIST = Object.values(MAPS).map(m => ({ id: m.id, name: m.name, size: `${m.width}×${m.height}` }));
 
+  function overlapRect(a, b) {
+    const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+    const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+    if (x2 - x1 <= 16 || y2 - y1 <= 16) return null;
+    return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+  }
+
+  function buildGates(def) {
+    const gates = [];
+    const seen = new Set();
+    let n = 0;
+    for (const room of def.rooms) {
+      for (const hall of def.halls) {
+        const o = overlapRect(room, hall);
+        if (!o) continue;
+        // Door slab is placed across the narrow dimension of the overlap.
+        const vertical = o.w <= o.h;
+        const w = vertical ? Math.min(20, o.w) : Math.max(42, Math.min(o.w - 8, 100));
+        const h = vertical ? Math.max(42, Math.min(o.h - 8, 100)) : Math.min(20, o.h);
+        const x = o.x + o.w / 2 - w / 2;
+        const y = o.y + o.h / 2 - h / 2;
+        const key = `${Math.round(x/10)}:${Math.round(y/10)}:${vertical?'v':'h'}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        gates.push({
+          id: `gate_${def.id}_${n++}`,
+          room: room.name,
+          x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h),
+          orientation: vertical ? 'vertical' : 'horizontal',
+          label: `${room.name} Gate`,
+        });
+      }
+    }
+    // Too many doors makes a large map frustrating. Keep a distributed set.
+    if (gates.length <= 14) return gates;
+    const step = gates.length / 14;
+    return Array.from({ length: 14 }, (_, i) => gates[Math.floor(i * step)]);
+  }
+
+  function buildWeaponStations(def) {
+    const preferred = ['Weapons', 'Armory', 'Security', 'Brig', 'Storage'];
+    const picked = [];
+    for (const name of preferred) {
+      const r = def.rooms.find(x => x.name === name);
+      if (r && !picked.includes(r)) picked.push(r);
+      if (picked.length >= 3) break;
+    }
+    if (!picked.length) picked.push(def.rooms[Math.min(1, def.rooms.length - 1)]);
+    return picked.map((r, i) => ({
+      id: `weapon_${def.id}_${i}`,
+      room: r.name,
+      x: Math.round(r.x + r.w * (i % 2 ? .68 : .32)),
+      y: Math.round(r.y + r.h * .58),
+      type: 'pulse',
+      label: 'Pulse Blaster Rack',
+    }));
+  }
+
   function buildMap(id) {
     const def = MAPS[id] || MAPS.skeld;
     const rooms = def.rooms, halls = def.halls;
@@ -106,10 +164,13 @@
         vents.push({ id: ids[k], room: rn, x: Math.round(r.x + r.w * (k % 2 ? .78 : .2)), y: Math.round(r.y + r.h * .8), connections: ids.filter(x => x !== ids[k]) });
       });
     });
+    const gates = buildGates(def);
+    const weaponStations = buildWeaponStations(def);
+    const theme = def.id === 'polus' ? 'ice' : def.id === 'fungle' ? 'jungle' : def.id === 'mira' ? 'station' : def.id === 'airship' ? 'industrial' : 'space';
     return {
-      id: def.id, name: def.name, width: def.width, height: def.height, spawn: def.spawn,
+      id: def.id, name: def.name, theme, width: def.width, height: def.height, spawn: def.spawn,
       rooms: walkable, collisionRects: [], taskLocations: taskSpots.map(t => ({ id: t.id, x: t.x, y: t.y })),
-      vents, emergencyButton: def.emergency,
+      vents, gates, weaponStations, emergencyButton: def.emergency,
       _taskSpots: taskSpots, _walkable: walkable, _namedRooms: rooms,
     };
   }
