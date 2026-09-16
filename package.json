@@ -1,7 +1,7 @@
 {
   "name": "space-party-server",
-  "version": "2.0.0",
-  "description": "Authoritative Socket.IO server for Space Party (multiplayer social deduction) with five selectable maps",
+  "version": "3.0.0",
+  "description": "Authoritative Socket.IO server for Space Party with public rooms, spectators, gates, pulse blasters, five maps and optional Z.AI bot assistance",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
