@@ -1,7 +1,7 @@
 {
   "name": "space-party-server",
-  "version": "3.0.0",
-  "description": "Authoritative Socket.IO server for Space Party with public rooms, spectators, gates, pulse blasters, five maps and optional Z.AI bot assistance",
+  "version": "3.1.0",
+  "description": "Space Party authoritative server with public rooms, spectators, gates, pulse blasters, admin powers, and Z.AI-assisted bot minds/chat",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
