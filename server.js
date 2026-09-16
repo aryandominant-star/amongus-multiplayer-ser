@@ -122,12 +122,15 @@ async function handleAiDecision(req, res) {
 
   try {
     const body = await readJson(req);
-    const mode = body.mode === 'meeting' ? 'meeting' : 'strategy';
+    const requestedMode = String(body.mode || 'strategy').toLowerCase();
+    const mode = ['meeting', 'radio', 'strategy'].includes(requestedMode) ? requestedMode : 'strategy';
     const context = body.context && typeof body.context === 'object' ? body.context : {};
 
     const system = mode === 'meeting'
-      ? 'You are a bot player in a cartoon spaceship social-deduction game. Speak naturally and briefly in a meeting. Use only facts in the supplied context. Never claim knowledge you were not given. Return JSON only: {"message":"...","voteTarget":null|string,"confidence":0..1}.'
-      : 'You are the high-level strategy brain for a bot in a cartoon spaceship social-deduction game. Low-level movement and rules are handled by deterministic code. Choose one useful high-level intent. Return JSON only: {"action":"task|investigate|follow|patrol|hunt|fake_task|vent|gate|weapon","targetPlayer":null|string,"targetRoom":null|string,"reason":"short reason"}. Never invent a room or player not in context.';
+      ? 'You are an intelligent bot player in a cartoon spaceship social-deduction game. Think privately, then speak naturally and briefly in the meeting. Base evidence claims only on supplied context. If you are an impostor you may lie, deflect, frame, or bluff, but never invent player or room names that are not supplied. Return JSON only: {"message":"one short in-character line","voteTarget":null|string,"confidence":0..1,"thought":"private inner reasoning, max 25 words"}.'
+      : mode === 'radio'
+        ? 'You are an intelligent bot astronaut replying over a live crew radio during a social-deduction match. Stay in character and react to the human message using your personality, role, memory, room, and nearby players. Crewmates should not know hidden information. Impostors may bluff or misdirect without admitting they are impostors. Keep the spoken reply short and natural. Return JSON only: {"message":"reply, max 28 words","thought":"private inner reasoning, max 25 words","mood":"calm|nervous|suspicious|confident|chaotic"}.'
+        : 'You are the high-level strategy brain for an intelligent bot in a cartoon spaceship social-deduction game. Low-level movement, collision, kills, tasks, and rules are deterministic. Think privately about evidence, personality, role, nearby players, memories, weapons, and gates, then choose one useful intent. You may optionally say one short in-character radio line. If you are an impostor, you may deceive without admitting your role. Return JSON only: {"action":"task|investigate|follow|patrol|hunt|fake_task|vent|gate|weapon","targetPlayer":null|string,"targetRoom":null|string,"reason":"short tactical reason","thought":"private inner reasoning, max 25 words","say":null|string}. Never invent a room or player not in context.';
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 9000);
@@ -141,8 +144,8 @@ async function handleAiDecision(req, res) {
         },
         body: JSON.stringify({
           model: ZAI_MODEL,
-          temperature: mode === 'meeting' ? 0.75 : 0.35,
-          max_tokens: mode === 'meeting' ? 120 : 160,
+          temperature: mode === 'strategy' ? 0.45 : 0.82,
+          max_tokens: mode === 'strategy' ? 210 : 170,
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: JSON.stringify(context) },
